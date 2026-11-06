@@ -1,17 +1,17 @@
-﻿name: arm64-emulator-verify
+name: arm64-emulator-verify
 
 on:
   workflow_dispatch:
     inputs:
       stage:
-        description: 'stage1=boot+install+login-wait'
+        description: 'stage1=boot only; full=whole chain'
         required: false
-        default: 'stage1'
+        default: 'full'
 
 jobs:
   verify:
     runs-on: macos-latest
-    timeout-minutes: 55
+    timeout-minutes: 300
     env:
       ANDROID_HOME: /Users/runner/android-sdk
     steps:
@@ -37,16 +37,25 @@ jobs:
         run: |
           echo "no" | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n test -k "system-images;android-34;google_apis;arm64-v8a" -d pixel_5
 
-      - name: Boot emulator
+      - name: Boot emulator (TCG, slow)
         run: |
-          nohup $ANDROID_HOME/emulator/emulator -avd test -no-window -no-audio -gpu swiftshader_indirect -no-snapshot -no-boot-anim > /tmp/emu.log 2>&1 &
-          adb wait-for-device
-          for i in $(seq 1 90); do
+          nohup $ANDROID_HOME/emulator/emulator -avd test -no-window -no-audio -gpu swiftshader_indirect -no-snapshot -no-boot-anim -accel off -memory 3072 > /tmp/emu.log 2>&1 &
+          echo "emulator pid: $!"
+          sleep 60
+          tail -30 /tmp/emu.log || true
+          adb devices || true
+          timeout 600 adb wait-for-device || echo "wait-for-device timed out"
+          tail -5 /tmp/emu.log || true
+          ok=""
+          for i in $(seq 1 240); do
             b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            if [ "$b" = "1" ]; then echo "BOOT COMPLETED"; break; fi
+            if [ "$b" = "1" ]; then echo "BOOT COMPLETED after $i cycles"; ok=1; break; fi
+            if [ $((i % 30)) -eq 0 ]; then tail -3 /tmp/emu.log || true; adb devices || true; fi
             sleep 10
           done
-          adb shell getprop ro.product.cpu.abilist
+          if [ -z "$ok" ]; then echo "BOOT NOT COMPLETED"; tail -40 /tmp/emu.log || true; fi
+          adb shell getprop ro.product.cpu.abilist || true
+          cp /tmp/emu.log ./emu.log || true
 
       - name: Patch WeChat 8.0.80 with Nuke
         run: |
@@ -57,40 +66,47 @@ jobs:
 
       - name: Install and launch WeChat
         run: |
+          for i in $(seq 1 30); do
+            s=$(adb get-state 2>/dev/null | tr -d '\r')
+            [ "$s" = "device" ] && break
+            sleep 10
+          done
           adb install -r -g patched.apk
           adb logcat -c
           adb shell monkey -p com.tencent.mm -c android.intent.category.LAUNCHER 1
-          sleep 45
+          sleep 60
+          adb exec-out screencap -p > screen-launch.png || true
           adb logcat -d > logcat.txt || true
-          echo "## LSPatch / Nuke lines" > summary.md
-          grep -E "LSPatch|LSPosed|Nuke|nuke" logcat.txt | head -60 >> summary.md || true
-          cat summary.md
+          grep -E "LSPatch|LSPosed|Nuke|nuke" logcat.txt | head -60 || true
 
       - name: Wait for WeChat login (scan QR) and record Nuke status
         run: |
           for i in $(seq 1 90); do
             focus=$(adb shell dumpsys window 2>/dev/null | grep -E "mCurrentFocus" | tr -d '\r')
             echo "[$i] $focus"
-            if echo "$focus" | grep -q "LauncherActivity\|MMMainActivity\|MainUITabActivity"; then
+            adb exec-out screencap -p > screen-$i.png 2>/dev/null || true
+            if echo "$focus" | grep -q "MMMainActivity\|MainUITabActivity"; then
               echo "LOGGED IN"
               break
             fi
-            adb exec-out screencap -p > screen.png 2>/dev/null || true
             sleep 10
           done
           adb exec-out screencap -p > final-screen.png || true
           adb logcat -d > final-logcat.txt || true
           grep -iE "nuke" final-logcat.txt | head -80 > nuke-log.txt || true
+          adb shell dumpsys package com.tencent.mm | head -40 > wx-package.txt || true
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-results
+          name: verify-results-${{ github.run_id }}
           path: |
+            emu.log
             logcat.txt
             final-logcat.txt
             nuke-log.txt
-            screen.png
+            wx-package.txt
+            screen-*.png
             final-screen.png
-            /tmp/emu.log
           if-no-files-found: warn
