@@ -1,4 +1,4 @@
-name: arm64-emulator-verify
+﻿name: arm64-emulator-verify
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   verify:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 55
     env:
       ANDROID_HOME: /Users/runner/android-sdk
